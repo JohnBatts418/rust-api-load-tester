@@ -1,0 +1,13 @@
+[package]
+name = "rocket-webserver"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures = "0.3.28"
+reqwest = {version = "0.11.18", features=["json"]}
+rocket = "=0.5.0-rc.3"
+serde = "1.0.164"
+tokio = {version="1.28.2", features = ["full"]}
