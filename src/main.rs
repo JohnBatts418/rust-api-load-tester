@@ -1,82 +1,125 @@
-use core::fmt;
-use std::thread;
-
-use serde::Deserialize;
+use rocket::serde::json::Json;
+use rocket::serde::{Deserialize, Serialize};
+use std::env;
+use std::fs::File;
+use std::io::Read;
 use tokio::task;
-
+extern crate redis;
+use async_recursion::async_recursion;
+use redis::Commands;
 #[macro_use]
 extern crate rocket;
 
-#[get("/")]
-fn index() -> &'static str {
-    "Hello, world!"
+#[derive(Deserialize)]
+struct SastAPIResponse {
+    status: String,
 }
 
-// We get the response from this one, but it is blocking.
-#[get("/api2")]
-async fn make_api_call2() -> String {
-    let ops = vec![1, 2, 3];
-    let mut tasks = Vec::with_capacity(ops.len());
-    for op in ops {
-        // This call will make them start running in the background
-        // immediately.
-        tasks.push(tokio::spawn(my_background_op(op)));
-    }
-
-    let mut outputs = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        outputs.push(task.await.unwrap());
-    }
-    println!("my outputs {:?}", outputs);
-
-    "Done with API calls 2".to_string()
-}
-async fn my_background_op(id: i32) -> String {
-    let s = format!("Starting background task {}.", id);
-    //sleep for 5 seconds
-    thread::sleep(std::time::Duration::from_secs(5));
-    println!("{}", s);
-    s
+#[derive(Deserialize, Clone)]
+struct Repo {
+    target: String,
+    hash: String,
 }
 
-//This one doesnt block, but we dont get the response
+#[derive(Serialize)]
+struct LoadTestStatus {
+    success: i32,
+    failures: i32,
+    total: i32,
+}
+
 #[get("/api")]
 async fn make_api_call() -> String {
-    let list_of_apis = [
-        String::from("https://dummyjson.com/products/1"),
-        String::from("https://dummyjson.com/products/2"),
-        String::from("https://dummyjson.com/products/3"),
-    ];
+    //read in github.json file
+    // let file = File::open("github.json").unwrap();
+    // let reader = BufReader::new(file);
+    let path = env::current_dir().unwrap();
+    println!("The current directory is {}", path.display());
 
-    let resp1 = task::spawn(request(5));
-    let resp2 = task::spawn(request(1));
+    let mut file = File::open("repo_lists/github.json").unwrap();
+    let mut buff = String::new();
+    file.read_to_string(&mut buff).unwrap();
 
-    //If you uncomment these, it blocks the resp until completion
-    // let _ = resp1.await.unwrap();
-    // let _ = resp2.await.unwrap();
+    let foo: Vec<Repo> = serde_json::from_str(&buff).unwrap();
+    println!("Target is: {}", foo[0].target);
+    println!("Hash is : {}", foo[0].hash);
 
-    "Done with API calls".to_string()
+    for api in foo.iter() {
+        task::spawn(trigger_analysis(api.clone()));
+    }
+
+    String::from("Triggered API calls...")
 }
 
-fn slowwly(delay_s: u32) -> reqwest::Url {
-    let url = format!("https://hub.dummyapis.com/delay?seconds={}", delay_s,);
-    reqwest::Url::parse(&url).unwrap()
-}
-async fn request(n: u32) {
-    reqwest::get(slowwly(n)).await.unwrap();
-    info!("Got response {}", n);
+#[get("/status/<id>")]
+async fn get_status(id: String) -> Json<LoadTestStatus> {
+    // connect to redis
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_connection().unwrap();
+
+    let length_of_success: i32 = con.scard("run1Success").unwrap();
+    let length_of_failures: i32 = con.scard("run1failures").unwrap();
+
+    let mut total: i32 = 0;
+    total += length_of_success;
+    total += length_of_failures;
+
+    let status = LoadTestStatus {
+        success: length_of_success,
+        failures: length_of_failures,
+        total,
+    };
+    Json(status)
 }
 
-#[derive(Deserialize)]
-struct APIResponse {
-    id: i32,
-    title: String,
+async fn trigger_analysis(single_repo_req: Repo) {
+    let body = poll_api(&single_repo_req).await;
+
+    println!(
+        "Finished polling for {}, got status {}",
+        single_repo_req.hash, body.status
+    );
+
+    // connect to redis
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_connection().unwrap();
+
+    if body.status == "SUCCESS" {
+        println!("Analysis succeeded for {}", single_repo_req.hash);
+        let _: () = con.sadd("run1Success", single_repo_req.target).unwrap();
+    } else {
+        println!("Analysis failed for {}", single_repo_req.hash);
+        let _: () = con.sadd("run1failures", single_repo_req.target).unwrap();
+    }
+}
+
+#[async_recursion]
+async fn poll_api(single_repo_req: &Repo) -> SastAPIResponse {
+    let body = reqwest::get(&single_repo_req.target)
+        .await
+        .unwrap()
+        .json::<SastAPIResponse>()
+        .await
+        .unwrap();
+
+    println!(
+        "Got response for hash {} with status {}",
+        single_repo_req.hash, body.status
+    );
+
+    //if the status is waiting then wait 2 seconds and try again
+    if body.status == "WAITING" {
+        println!("Waiting for analysis to complete...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        poll_api(single_repo_req).await
+    } else {
+        body
+    }
 }
 
 #[launch]
 fn rocket() -> _ {
     rocket::build()
-        .mount("/", routes![index])
         .mount("/", routes![make_api_call])
-        .mount("/", routes![make_api_call2])
+        .mount("/", routes![get_status])
 }

@@ -1,0 +1,6 @@
+[
+  {
+    "target": "http://127.0.0.1:5500/apis/get_analysis.json",
+    "hash": "1234567890"
+  }
+]
